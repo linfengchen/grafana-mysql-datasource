@@ -93,12 +93,34 @@ JSON_UNQUOTE(JSON_EXTRACT(log_attributes, '$."response_code"')) = '200'
 
 取值与 WHERE 条件统一走 `JSON_UNQUOTE(JSON_EXTRACT(列, '$."键"'))`。
 
-## 五、注意事项 / 限制
+## 五、稀疏 JSON 键（重要）
 
-1. **强刷页面**：插件更新后首次使用，按 `Ctrl/Cmd + Shift + R` 清掉浏览器缓存的旧前端。
-2. **键来自采样**：只在很老数据里出现的 JSON 键可能不在自动列表里 → 用手输 + “Allow custom values” 补。
-3. **值下拉性能**：JSON 字段取唯一值是全表扫描，大表会慢几秒（已限制最多 1000 个值）。
-4. **探测上限**：自动探测最多 40 列，超宽 schema 不会全扫。
+像 `body` 这种**自由格式**的 JSON 列，不同日志类型的键差别很大，某些键只占极小比例
+（例如 `channel_id` 只出现在 `one-api` 的访问日志里，约占全表 0.2%）。对这类**稀疏键**：
+
+- **key 下拉里可能不会自动出现**（自动发现按采样，采不到就没有）；
+- **值下拉可能为空**（取值查询对 JSON 列有扫描上限以保证响应速度，采样没覆盖到就空）。
+
+**正确用法**：直接**手动输入**。前提是变量里勾了 **Allow custom values**。
+
+1. 在 key 输入框打 `otel_logs.body["channel_id"]`，即使提示 “No options found”，**按回车**把它作为自定义 key 加入；
+2. 选操作符（如 `=`）；
+3. 在值输入框直接打具体值（如 `6`），**按回车**确认。
+
+> 关键认知：**值下拉只是「建议」，过滤本身是精确的**——即使建议列表里没有 `6`，
+> 手输 `6` 后过滤会作用到全表所有数据，结果完全准确。
+
+相对地，`resource_attributes`、`log_attributes` 这类**结构化属性列**键集是固定的、覆盖完整，
+直接在下拉里选即可（如 `response_code`、`k8s.pod.name`、`service.name`）。
+
+## 六、注意事项 / 限制
+
+1. **强刷页面**：插件更新后首次使用，按 `Ctrl/Cmd + Shift + R` 清掉浏览器缓存的旧前端
+   （走反代域名时可能要刷两次或用无痕窗口）。
+2. **键来自采样**：稀疏 / 仅历史数据里出现的 JSON 键可能不在自动列表 → 手输 + “Allow custom values” 补。
+3. **值下拉性能**：JSON 字段取值有扫描上限（默认 20 万行）以保证秒级响应，稀疏键的建议值可能不全；
+   普通列为完整 DISTINCT。
+4. **探测上限**：自动发现最多探测 40 列，超宽 schema 不会全扫。
 5. 这是未签名的自定义插件，需在 Grafana 用 `GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=evomap-mysql-datasource` 放行。
 
 ## 六、相关代码
