@@ -1,7 +1,7 @@
 {
   "type": "datasource",
   "name": "MySQL",
-  "id": "mysql",
+  "id": "evomap-mysql-datasource",
   "executable": "gpx_grafana-mysql-datasource",
   "category": "sql",
 

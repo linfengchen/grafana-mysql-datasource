@@ -2,7 +2,7 @@ import { expect, test, type ExplorePage } from '@grafana/plugin-e2e';
 import type { Page, Response } from '@playwright/test';
 
 const PROVISIONED_UID = 'mysql-ds-m';
-const PLUGIN_ID = 'mysql';
+const PLUGIN_ID = 'evomap-mysql-datasource';
 const DS_DATABASE = process.env.DS_INSTANCE_DATABASE ?? 'testdata';
 
 /**

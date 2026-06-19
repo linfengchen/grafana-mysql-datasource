@@ -222,6 +222,12 @@ func (m *mySQLMacroEngine) evaluateMacro(timeRange backend.TimeRange, query *bac
 			return tg + " AS \"time\"", nil
 		}
 		return "", err
+	case "__adHocFilter":
+		// Ad hoc filters are expanded on the frontend before the query reaches the
+		// backend. This fallback keeps the SQL valid when the macro is evaluated in
+		// contexts without ad hoc filters (e.g. alerting), where it always resolves
+		// to no filtering.
+		return "1=1", nil
 	default:
 		return "", fmt.Errorf("unknown macro %v", name)
 	}

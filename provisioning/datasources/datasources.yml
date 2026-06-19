@@ -3,7 +3,7 @@ apiVersion: 1
 datasources:
   - name: 'mysql'
     uid: 'mysql-ds-m' # match provisioned datasource in datasourcese2e instance
-    type: 'mysql'
+    type: 'evomap-mysql-datasource'
     access: proxy
     isDefault: true
     orgId: 1

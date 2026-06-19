@@ -24,21 +24,21 @@ test.describe('Config editor', () => {
       'smoke: should render config editor',
       { tag: '@plugins' },
       async ({ createDataSourceConfigPage, page }) => {
-        await createDataSourceConfigPage({ type: 'mysql' });
+        await createDataSourceConfigPage({ type: 'evomap-mysql-datasource' });
         await expect(page.getByRole('heading', { name: 'Connection', exact: true })).toBeVisible();
         await expect(page.getByRole('heading', { name: 'Authentication' })).toBeVisible();
       }
     );
 
     test('should render Connection section fields', async ({ createDataSourceConfigPage, page }) => {
-      await createDataSourceConfigPage({ type: 'mysql' });
+      await createDataSourceConfigPage({ type: 'evomap-mysql-datasource' });
       await expect(page.getByRole('heading', { name: 'Connection', exact: true })).toBeVisible();
       await expect(page.getByPlaceholder('localhost:3306')).toBeVisible();
       await expect(page.getByPlaceholder('Database')).toBeVisible();
     });
 
     test('should render Authentication section fields', async ({ createDataSourceConfigPage, page }) => {
-      await createDataSourceConfigPage({ type: 'mysql' });
+      await createDataSourceConfigPage({ type: 'evomap-mysql-datasource' });
       await expect(page.getByRole('heading', { name: 'Authentication' })).toBeVisible();
       await expect(page.getByPlaceholder('Username')).toBeVisible();
       await expect(page.getByPlaceholder('Password')).toBeVisible();
@@ -49,7 +49,7 @@ test.describe('Config editor', () => {
     });
 
     test('should render Additional settings section', async ({ createDataSourceConfigPage, page }) => {
-      await createDataSourceConfigPage({ type: 'mysql' });
+      await createDataSourceConfigPage({ type: 'evomap-mysql-datasource' });
       await expect(page.getByRole('heading', { name: 'Additional settings' })).toBeVisible();
       await expect(page.getByText('Session timezone').first()).toBeVisible();
       await expect(page.getByText('Min time interval').first()).toBeVisible();
@@ -108,7 +108,7 @@ test.describe('Config editor', () => {
       // `localhost` from inside the Grafana container never resolves to the
       // MySQL service, so this is a reliable way to force a connection
       // failure without mocking.
-      const configPage = await createDataSourceConfigPage({ type: 'mysql' });
+      const configPage = await createDataSourceConfigPage({ type: 'evomap-mysql-datasource' });
       await page.getByPlaceholder('localhost:3306').fill('localhost:3306');
       await page.getByPlaceholder('Username').fill('grafana');
       await page.getByPlaceholder('Password').fill('wrong-password');
@@ -120,7 +120,7 @@ test.describe('Config editor', () => {
       createDataSourceConfigPage,
       page,
     }) => {
-      const configPage = await createDataSourceConfigPage({ type: 'mysql' });
+      const configPage = await createDataSourceConfigPage({ type: 'evomap-mysql-datasource' });
       await page.getByPlaceholder('localhost:3306').fill('unreachable.invalid:3306');
       await page.getByPlaceholder('Username').fill('grafana');
       await page.getByPlaceholder('Password').fill('grafana');

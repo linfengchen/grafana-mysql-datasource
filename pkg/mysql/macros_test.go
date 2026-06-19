@@ -37,6 +37,13 @@ func TestMacroEngine(t *testing.T) {
 			require.Equal(t, "select min(UNIX_TIMESTAMP(time_column) as time_sec)", sql)
 		})
 
+		t.Run("interpolate __adHocFilter function falls back to 1=1", func(t *testing.T) {
+			sql, err := engine.Interpolate(query, timeRange, "WHERE $__adHocFilter()")
+			require.Nil(t, err)
+
+			require.Equal(t, "WHERE 1=1", sql)
+		})
+
 		t.Run("interpolate __timeGroup function", func(t *testing.T) {
 			sql, err := engine.Interpolate(query, timeRange, "GROUP BY $__timeGroup(time_column,'5m')")
 			require.Nil(t, err)

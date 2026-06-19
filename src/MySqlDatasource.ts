@@ -1,6 +1,14 @@
 import { v4 as uuidv4 } from 'uuid';
 
-import { type DataSourceInstanceSettings, type TimeRange } from '@grafana/data';
+import {
+  type AdHocVariableFilter,
+  type DataSourceGetTagKeysOptions,
+  type DataSourceGetTagValuesOptions,
+  type DataSourceInstanceSettings,
+  type MetricFindValue,
+  type ScopedVars,
+  type TimeRange,
+} from '@grafana/data';
 import { CompletionItemKind, type LanguageDefinition, type TableIdentifier } from '@grafana/plugin-ui';
 import {
   COMMON_FNS,
@@ -13,6 +21,7 @@ import {
   formatSQL,
 } from '@grafana/sql';
 
+import { applyAdHocFilters, buildTagKeysQuery, buildTagValuesQuery } from './adHocFilters';
 import { mapFieldsToTypes } from './fields';
 import { buildColumnQuery, buildTableQuery, showDatabases } from './mySqlMetaQuery';
 import { getSqlCompletionProvider } from './sqlCompletionProvider';
@@ -29,6 +38,31 @@ export class MySqlDatasource extends SqlDatasource {
 
   getQueryModel() {
     return { quoteLiteral };
+  }
+
+  // Expands the `$__adHocFilter()` macro using the dashboard's ad hoc filters
+  // before the query reaches the backend. `SqlDatasource` drops the `filters`
+  // argument that `DataSourceWithBackend.query()` provides, so we reinstate it.
+  applyTemplateVariables(target: SQLQuery, scopedVars: ScopedVars, filters?: AdHocVariableFilter[]) {
+    const result = super.applyTemplateVariables(target, scopedVars);
+    if (result.rawSql) {
+      result.rawSql = applyAdHocFilters(result.rawSql, filters);
+    }
+    return result;
+  }
+
+  // Provides the column list (`table.column`) used by the ad hoc filter UI.
+  async getTagKeys(_options?: DataSourceGetTagKeysOptions<SQLQuery>): Promise<MetricFindValue[]> {
+    const database = this.instanceSettings.jsonData.database;
+    const rows = await this.runSql<string[]>(buildTagKeysQuery(database), { refId: 'tagKeys' });
+    return rows.map((row) => ({ text: row[0] }));
+  }
+
+  // Provides the distinct values for a selected ad hoc filter key.
+  async getTagValues(options: DataSourceGetTagValuesOptions<SQLQuery>): Promise<MetricFindValue[]> {
+    const database = this.instanceSettings.jsonData.database;
+    const rows = await this.runSql<string[]>(buildTagValuesQuery(options.key, database), { refId: 'tagValues' });
+    return rows.map((row) => ({ text: String(row[0]) }));
   }
 
   getSqlLanguageDefinition(): LanguageDefinition {
