@@ -185,14 +185,14 @@ describe('JSON key auto-discovery', () => {
     expect(shouldProbeForJsonKeys('datetime')).toBe(false);
   });
 
-  it('builds a bounded JSON_KEYS sampling query', () => {
+  it('builds a bounded JSON_KEYS sampling query that flattens the key array', () => {
     expect(buildJsonKeysSampleQuery('otel_logs', 'body', 'otel')).toBe(
-      'SELECT JSON_KEYS(CAST(body AS STRING)) FROM otel.otel_logs WHERE body IS NOT NULL LIMIT 500'
+      "SELECT array_join(JSON_KEYS(CAST(body AS STRING)), ',') FROM otel.otel_logs WHERE body IS NOT NULL LIMIT 500"
     );
   });
 
-  it('unions, sorts and de-duplicates sampled key arrays', () => {
-    const rows = [['["b","a"]'], ['["a","c"]'], [null as unknown as string], ['not-json'], ['"scalar"']];
+  it('unions, sorts and de-duplicates the comma-joined key strings', () => {
+    const rows = [['b,a'], ['a,c'], [null as unknown as string], [''], ['  c , a ']];
     expect(collectJsonKeys(rows)).toEqual(['a', 'b', 'c']);
   });
 

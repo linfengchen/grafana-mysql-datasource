@@ -198,23 +198,34 @@ export function shouldProbeForJsonKeys(dataType: string): boolean {
   return JSON_PROBE_TYPES.has(dataType.trim().toLowerCase());
 }
 
+// Separator used to flatten each row's key array into a scalar string. JSON
+// object keys in practice are identifiers and never contain this character.
+const JSON_KEYS_SEPARATOR = ',';
+
 /**
  * Query that samples a column and returns, per row, the JSON object's top-level
- * keys as a JSON array (or NULL for non-JSON values). The caller unions the
- * arrays across rows. `CAST(... AS STRING)` lets this work for both `variant`
- * and plain text columns; `JSON_KEYS` yields NULL (not an error) for non-JSON.
+ * keys as a comma-joined string (or NULL for non-JSON values). The caller splits
+ * and unions the keys across rows.
+ *
+ * `CAST(... AS STRING)` lets this work for both `variant` and plain text columns,
+ * and `JSON_KEYS` yields NULL (not an error) for non-JSON values. `array_join`
+ * is required because `JSON_KEYS` returns an `array<text>` whose column type the
+ * Grafana MySQL backend cannot serialize — without it the whole field is dropped
+ * and no keys are discovered.
  */
 export function buildJsonKeysSampleQuery(table: string, column: string, database?: string, sampleSize = 500): string {
   const col = quoteIdentifierIfNecessary(column);
   const tableName = quoteIdentifierIfNecessary(table);
   const from = database ? `${quoteIdentifierIfNecessary(database)}.${tableName}` : tableName;
-  return `SELECT JSON_KEYS(CAST(${col} AS STRING)) FROM ${from} WHERE ${col} IS NOT NULL LIMIT ${sampleSize}`;
+  return (
+    `SELECT array_join(JSON_KEYS(CAST(${col} AS STRING)), ${quoteLiteral(JSON_KEYS_SEPARATOR)}) ` +
+    `FROM ${from} WHERE ${col} IS NOT NULL LIMIT ${sampleSize}`
+  );
 }
 
 /**
- * Unions the JSON-key arrays returned by {@link buildJsonKeysSampleQuery} into a
- * sorted, de-duplicated list. Each input cell is a JSON array string such as
- * `["level", "method"]`; NULL/empty/malformed cells are skipped.
+ * Unions the comma-joined key strings returned by {@link buildJsonKeysSampleQuery}
+ * into a sorted, de-duplicated list. NULL/empty cells are skipped.
  */
 export function collectJsonKeys(rows: string[][], limit = 200): string[] {
   const keys = new Set<string>();
@@ -223,17 +234,11 @@ export function collectJsonKeys(rows: string[][], limit = 200): string[] {
     if (!cell) {
       continue;
     }
-    try {
-      const parsed = JSON.parse(cell);
-      if (Array.isArray(parsed)) {
-        for (const k of parsed) {
-          if (typeof k === 'string') {
-            keys.add(k);
-          }
-        }
+    for (const part of cell.split(JSON_KEYS_SEPARATOR)) {
+      const key = part.trim();
+      if (key) {
+        keys.add(key);
       }
-    } catch {
-      // Not a JSON array (non-JSON column) — ignore.
     }
   }
   return Array.from(keys)
