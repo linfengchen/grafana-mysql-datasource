@@ -4,9 +4,15 @@ import {
   adHocColumn,
   applyAdHocFilters,
   buildAdHocFilterClause,
+  buildJsonAdHocKey,
+  buildJsonKeysSampleQuery,
+  buildTagColumnsQuery,
   buildTagKeysQuery,
   buildTagValuesQuery,
+  collectJsonKeys,
   filterToSql,
+  parseAdHocKey,
+  shouldProbeForJsonKeys,
 } from './adHocFilters';
 
 const filter = (overrides: Partial<AdHocVariableFilter>): AdHocVariableFilter => ({
@@ -23,6 +29,27 @@ describe('adHocColumn', () => {
 
   it('returns a bare key unchanged', () => {
     expect(adHocColumn('host')).toBe('host');
+  });
+});
+
+describe('JSON drill-down keys', () => {
+  it('filters on a JSON path with JSON_UNQUOTE(JSON_EXTRACT(...))', () => {
+    expect(filterToSql(filter({ key: 'otel_logs.body["channel_id"]', value: '6' }))).toBe(
+      `JSON_UNQUOTE(JSON_EXTRACT(body, '$."channel_id"')) = '6'`
+    );
+  });
+
+  it('supports nested JSON paths', () => {
+    expect(filterToSql(filter({ key: 'logs.payload["a"]["b"]', value: 'x' }))).toBe(
+      `JSON_UNQUOTE(JSON_EXTRACT(payload, '$."a"."b"')) = 'x'`
+    );
+  });
+
+  it('lists distinct values of a JSON path scoped to the table', () => {
+    expect(buildTagValuesQuery('otel_logs.body["channel_id"]', 'otel')).toBe(
+      `SELECT DISTINCT JSON_UNQUOTE(JSON_EXTRACT(body, '$."channel_id"')) FROM otel.otel_logs ` +
+        `WHERE JSON_UNQUOTE(JSON_EXTRACT(body, '$."channel_id"')) IS NOT NULL ORDER BY 1 LIMIT 1000`
+    );
   });
 });
 
@@ -132,6 +159,46 @@ describe('buildTagKeysQuery', () => {
 
   it('falls back to database() when no database is given', () => {
     expect(buildTagKeysQuery()).toContain('table_schema = database()');
+  });
+});
+
+describe('JSON key auto-discovery', () => {
+  it('parses a bracketed JSON key into table/column/path', () => {
+    expect(parseAdHocKey('otel_logs.resource_attributes["k8s.pod.name"]')).toEqual({
+      table: 'otel_logs',
+      column: 'resource_attributes',
+      jsonPath: ['k8s.pod.name'],
+    });
+  });
+
+  it('round-trips buildJsonAdHocKey through parseAdHocKey', () => {
+    const key = buildJsonAdHocKey('otel_logs', 'log_attributes', 'response_code');
+    expect(key).toBe('otel_logs.log_attributes["response_code"]');
+    expect(parseAdHocKey(key).jsonPath).toEqual(['response_code']);
+  });
+
+  it('treats variant/json and text types as JSON probe candidates', () => {
+    expect(shouldProbeForJsonKeys('variant')).toBe(true);
+    expect(shouldProbeForJsonKeys('JSON')).toBe(true);
+    expect(shouldProbeForJsonKeys('varchar')).toBe(true);
+    expect(shouldProbeForJsonKeys('int')).toBe(false);
+    expect(shouldProbeForJsonKeys('datetime')).toBe(false);
+  });
+
+  it('builds a bounded JSON_KEYS sampling query', () => {
+    expect(buildJsonKeysSampleQuery('otel_logs', 'body', 'otel')).toBe(
+      'SELECT JSON_KEYS(CAST(body AS STRING)) FROM otel.otel_logs WHERE body IS NOT NULL LIMIT 500'
+    );
+  });
+
+  it('unions, sorts and de-duplicates sampled key arrays', () => {
+    const rows = [['["b","a"]'], ['["a","c"]'], [null as unknown as string], ['not-json'], ['"scalar"']];
+    expect(collectJsonKeys(rows)).toEqual(['a', 'b', 'c']);
+  });
+
+  it('selects column metadata including data_type', () => {
+    expect(buildTagColumnsQuery('otel')).toContain('table_name, column_name, data_type');
+    expect(buildTagColumnsQuery('otel')).toContain("table_schema = 'otel'");
   });
 });
 
