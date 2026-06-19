@@ -255,13 +255,32 @@ export function buildJsonAdHocKey(table: string, column: string, jsonKey: string
   return `${table}.${column}[${JSON.stringify(jsonKey)}]`;
 }
 
+// Row cap for the inner scan of a JSON value lookup. Extracting a JSON path on
+// every row is expensive, so a full scan of a large table can take minutes and
+// time out the value picker. Bounding the scan keeps it responsive; suggestions
+// may be incomplete, but "Allow custom values" lets users type exact values and
+// the filter itself still applies to all rows.
+const JSON_VALUE_SCAN_LIMIT = 200000;
+
 /**
  * Query that lists the distinct values of an ad hoc filter key (`table.column`).
+ * Plain columns are scanned in full (Doris evaluates columnar DISTINCT cheaply);
+ * JSON drill-downs are bounded to {@link JSON_VALUE_SCAN_LIMIT} rows to stay fast.
  */
 export function buildTagValuesQuery(key: string, database?: string, limit = 1000): string {
   const { table, column, jsonPath } = parseAdHocKey(key);
   const tableName = quoteIdentifierIfNecessary(table ?? column);
   const from = database ? `${quoteIdentifierIfNecessary(database)}.${tableName}` : tableName;
   const expr = columnExpr(column, jsonPath);
-  return `SELECT DISTINCT ${expr} FROM ${from} WHERE ${expr} IS NOT NULL ORDER BY 1 LIMIT ${limit}`;
+
+  if (jsonPath.length === 0) {
+    return `SELECT DISTINCT ${expr} FROM ${from} WHERE ${expr} IS NOT NULL ORDER BY 1 LIMIT ${limit}`;
+  }
+
+  const col = quoteIdentifierIfNecessary(column);
+  return (
+    `SELECT DISTINCT ${expr} FROM ` +
+    `(SELECT ${col} FROM ${from} WHERE ${col} IS NOT NULL LIMIT ${JSON_VALUE_SCAN_LIMIT}) t ` +
+    `WHERE ${expr} IS NOT NULL ORDER BY 1 LIMIT ${limit}`
+  );
 }

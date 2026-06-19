@@ -45,9 +45,10 @@ describe('JSON drill-down keys', () => {
     );
   });
 
-  it('lists distinct values of a JSON path scoped to the table', () => {
+  it('lists distinct values of a JSON path with a bounded inner scan', () => {
     expect(buildTagValuesQuery('otel_logs.body["channel_id"]', 'otel')).toBe(
-      `SELECT DISTINCT JSON_UNQUOTE(JSON_EXTRACT(body, '$."channel_id"')) FROM otel.otel_logs ` +
+      `SELECT DISTINCT JSON_UNQUOTE(JSON_EXTRACT(body, '$."channel_id"')) FROM ` +
+        `(SELECT body FROM otel.otel_logs WHERE body IS NOT NULL LIMIT 200000) t ` +
         `WHERE JSON_UNQUOTE(JSON_EXTRACT(body, '$."channel_id"')) IS NOT NULL ORDER BY 1 LIMIT 1000`
     );
   });
