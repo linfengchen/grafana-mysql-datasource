@@ -158,8 +158,11 @@ JSON_UNQUOTE(JSON_EXTRACT(log_attributes, '$."response_code"')) = '200'
 1. **强刷页面**：插件更新后首次使用，按 `Ctrl/Cmd + Shift + R` 清掉浏览器缓存的旧前端
    （走反代域名时可能要刷两次或用无痕窗口）。
 2. **键来自采样**：稀疏 / 仅历史数据里出现的 JSON 键可能不在自动列表 → 手输 + “Allow custom values” 补。
-3. **值下拉性能**：JSON 字段取值有扫描上限（默认 20 万行）以保证秒级响应，稀疏键的建议值可能不全；
-   普通列为完整 DISTINCT。
+3. **值下拉性能**：JSON 字段取值会被限制在「最近一段数据」内（窗口宽度 = 当前仪表盘时间范围，
+   锚定在数据自身的 `MAX(时间列)` 上，**与时区无关**，靠按天分区裁剪），并叠加 2 万行扫描上限，
+   保证秒级响应。代价是稀疏键/更早数据里的建议值可能不全 → 手输 + “Allow custom values” 补。
+   时间列自动从 `information_schema` 探测（datetime/timestamp/date，优先 `timestamp` 等常见名）。
+   普通列为完整 DISTINCT（Doris 列式去重很快），不加窗口。
 4. **探测上限**：自动发现最多探测 40 列，超宽 schema 不会全扫。
 5. 这是未签名的自定义插件，需在 Grafana 用 `GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=evomap-mysql-datasource` 放行。
 
