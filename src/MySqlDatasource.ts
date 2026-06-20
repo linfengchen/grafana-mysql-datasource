@@ -56,6 +56,13 @@ export class MySqlDatasource extends SqlDatasource {
   constructor(instanceSettings: DataSourceInstanceSettings<MySQLOptions>) {
     super(instanceSettings);
     this.variables = new SQLVariableSupport(this);
+    // Advertise the multi-value ad hoc operators so Grafana shows "is one of"
+    // (=|) and "is not one of" (!=|) in the operator dropdown; filterToSql maps
+    // them to IN / NOT IN. (Regex operators =~/!~ are shown by Grafana whenever
+    // the variable has "Allow custom values" enabled — no plugin flag for those.)
+    if (this.meta) {
+      this.meta.multiValueFilterOperators = true;
+    }
   }
 
   getQueryModel() {
