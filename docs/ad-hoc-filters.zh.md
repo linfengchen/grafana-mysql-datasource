@@ -85,8 +85,10 @@ JSON_UNQUOTE(JSON_EXTRACT(log_attributes, '$."response_code"')) = '200'
 
 1. 读 `information_schema.columns` 拿到所有列及其 `data_type`；
 2. 对 `variant`/`json` 和文本列（`varchar`/`text`/...）采样
-   `SELECT JSON_KEYS(CAST(列 AS STRING)) ... LIMIT 500`，在前端把各行的键数组**去重合并**
-   （非 JSON 列返回 `NULL`，自动忽略，不报错）；
+   `SELECT array_join(JSON_KEYS(CAST(列 AS STRING)), ',') ... LIMIT 500`，在前端把各行的键**去重合并**
+   （非 JSON 列返回 `NULL`，自动忽略，不报错）。
+   > 用 `array_join` 而非裸 `JSON_KEYS`，是因为 Doris 的 `JSON_KEYS` 返回 `array<text>`，
+   > Grafana 的 MySQL 后端无法序列化该类型会丢行，拼成普通字符串后才稳定；
 3. 把发现了键的 JSON 列替换成 `列["键"]` 形式列出（裸的 JSON 列会被隐藏，
    因为它无法直接 `DISTINCT` 取唯一值）；数字/时间列跳过探测；
 4. 探测并发执行，最多探测 40 列，避免超宽 schema 把下拉打开变慢。
@@ -113,7 +115,45 @@ JSON_UNQUOTE(JSON_EXTRACT(log_attributes, '$."response_code"')) = '200'
 相对地，`resource_attributes`、`log_attributes` 这类**结构化属性列**键集是固定的、覆盖完整，
 直接在下拉里选即可（如 `response_code`、`k8s.pod.name`、`service.name`）。
 
-## 六、注意事项 / 限制
+## 六、级联过滤与全局条件
+
+### 级联（已选条件自动收窄后续 key/value）
+
+选过滤器时，**之前已选的条件会自动作用到后面的字段/值下拉**——只列出在「匹配已选条件的行」里真实存在的 key 和 value，避免一堆无关服务的字段/值涌进选择框。
+
+例：先选 `otel_logs.service_name = one-api`，再选 `otel_logs.body["status_code"]` 时，值下拉只列出 one-api 日志里出现过的状态码；`body` 的 JSON 子键发现也只采样 one-api 的行。
+
+原理：插件用 Grafana 传入的 `options.filters`（其他已选过滤 + baseFilters，v10.3+）拼进 `WhERE`：
+
+- **值查询**：`... WHERE 表达式 IS NOT NULL AND <已选条件>`；JSON 字段把已选条件压进内层扫描子查询，保证扫描上限窗口里采到的是相关行。
+- **JSON key 采样**：`... WHERE 列 IS NOT NULL AND <已选条件>`。
+- 护栏：自动排除正在编辑的那个 key，且只采用**同表**的过滤条件（跨表列名不存在会报错）。
+
+> 注意：顶部的 `namespace/container/pod` 是 constant/query 变量，**不是 ad-hoc 过滤项**，不会参与级联收窄。要让它们也收窄下拉，把它们做成下面的 `baseFilters`。
+
+### 全局过滤条件（baseFilters）
+
+给 ad-hoc 变量配 `baseFilters`：**始终生效、UI 隐藏、不可删**的条件。在变量 JSON（Dashboard settings → Variables → 该变量 → 右上 JSON model，或直接编辑 Dashboard JSON）里加：
+
+```json
+{
+  "name": "filters",
+  "type": "adhoc",
+  "datasource": { "type": "evomap-mysql-datasource", "uid": "<你的数据源uid>" },
+  "baseFilters": [
+    { "key": "otel_logs.service_name", "operator": "=", "value": "one-api" }
+  ]
+}
+```
+
+- baseFilters 会进 `options.filters` → **后续所有 key/value 下拉自动只剩该上下文**（如只剩 one-api）。
+- baseFilters 也会进 `$__adHocFilter()` 真正过滤面板数据——**前提是面板 SQL 里有该宏**（见第二节）。
+
+### 静态 key 白名单（可选）
+
+变量编辑页的 **"Use static key dimensions"** 开关：直接 CSV 列出你只想要的 key，从源头干掉噪音。缺点是固定列表、不自动发现 JSON 子键。适合 key 集合明确、不想看到任何其他列的场景。
+
+## 七、注意事项 / 限制
 
 1. **强刷页面**：插件更新后首次使用，按 `Ctrl/Cmd + Shift + R` 清掉浏览器缓存的旧前端
    （走反代域名时可能要刷两次或用无痕窗口）。
@@ -123,7 +163,7 @@ JSON_UNQUOTE(JSON_EXTRACT(log_attributes, '$."response_code"')) = '200'
 4. **探测上限**：自动发现最多探测 40 列，超宽 schema 不会全扫。
 5. 这是未签名的自定义插件，需在 Grafana 用 `GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=evomap-mysql-datasource` 放行。
 
-## 六、相关代码
+## 八、相关代码
 
 - 过滤器宏 / JSON 下钻 / 键值查询：[`src/adHocFilters.ts`](../src/adHocFilters.ts)
 - 字段自动发现（`getTagKeys` / `getTagValues`）：[`src/MySqlDatasource.ts`](../src/MySqlDatasource.ts)
