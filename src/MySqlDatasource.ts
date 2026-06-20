@@ -27,7 +27,10 @@ import {
   buildJsonKeysSampleQuery,
   buildTagColumnsQuery,
   buildTagValuesQuery,
+  buildTimeColumnQuery,
   collectJsonKeys,
+  parseAdHocKey,
+  pickTimeColumn,
   shouldProbeForJsonKeys,
 } from './adHocFilters';
 import { mapFieldsToTypes } from './fields';
@@ -42,6 +45,13 @@ export class MySqlDatasource extends SqlDatasource {
   // Caps how many columns are sampled for JSON keys so a wide schema cannot fan
   // out into an unbounded number of probe queries when the filter UI opens.
   private static readonly MAX_JSON_PROBE_COLUMNS = 40;
+
+  // Recent-data window applied to JSON scans when the request carries no time
+  // range, so the value/key pickers stay bounded on huge partitioned tables.
+  private static readonly DEFAULT_WINDOW_SECONDS = 6 * 3600;
+
+  // Per-table time column ('' = none), resolved lazily from information_schema.
+  private readonly timeColumnCache = new Map<string, string>();
 
   constructor(instanceSettings: DataSourceInstanceSettings<MySQLOptions>) {
     super(instanceSettings);
@@ -71,9 +81,23 @@ export class MySqlDatasource extends SqlDatasource {
   async getTagKeys(options?: DataSourceGetTagKeysOptions<SQLQuery>): Promise<MetricFindValue[]> {
     const database = this.instanceSettings.jsonData.database;
     const filters = options?.filters;
+    const windowSeconds = this.windowSeconds(options?.timeRange);
     const frame = await this.runSql<string[]>(buildTagColumnsQuery(database), { refId: 'tagKeys' });
     // DataFrameView rows are positional: [table_name, column_name, data_type].
     const columns = frame.map((row) => ({ table: row[0], column: row[1], dataType: row[2] }));
+
+    // Detect each table's time column from the metadata we already fetched so the
+    // JSON key sampling can be bounded to recent partitions.
+    const colsByTable = new Map<string, Array<{ name: string; dataType: string }>>();
+    for (const { table, column, dataType } of columns) {
+      const list = colsByTable.get(table) ?? [];
+      list.push({ name: column, dataType: dataType ?? '' });
+      colsByTable.set(table, list);
+    }
+    const timeColumnByTable = new Map<string, string | null>();
+    for (const [table, cols] of colsByTable) {
+      timeColumnByTable.set(table, pickTimeColumn(cols));
+    }
 
     // Preserve information_schema ordering; the map lets us drop a bare JSON
     // column once we discover drillable keys for it.
@@ -89,9 +113,15 @@ export class MySqlDatasource extends SqlDatasource {
     const sampled = await Promise.all(
       probes.slice(0, MySqlDatasource.MAX_JSON_PROBE_COLUMNS).map(async ({ table, column }) => {
         try {
-          const sample = await this.runSql<string[]>(buildJsonKeysSampleQuery(table, column, database, filters), {
-            refId: `jsonKeys:${table}.${column}`,
-          });
+          const sample = await this.runSql<string[]>(
+            buildJsonKeysSampleQuery(table, column, database, filters, {
+              timeColumn: timeColumnByTable.get(table) ?? undefined,
+              windowSeconds,
+            }),
+            {
+              refId: `jsonKeys:${table}.${column}`,
+            }
+          );
           // Normalize the DataFrameView into positional rows before unioning keys.
           const rows = sample.map((row) => [row[0]]);
           return { table, column, jsonKeys: collectJsonKeys(rows) };
@@ -119,10 +149,46 @@ export class MySqlDatasource extends SqlDatasource {
   // Provides the distinct values for a selected ad hoc filter key.
   async getTagValues(options: DataSourceGetTagValuesOptions<SQLQuery>): Promise<MetricFindValue[]> {
     const database = this.instanceSettings.jsonData.database;
-    const rows = await this.runSql<string[]>(buildTagValuesQuery(options.key, database, options.filters), {
-      refId: 'tagValues',
-    });
+    const { table } = parseAdHocKey(options.key);
+    const timeColumn = table ? await this.resolveTimeColumn(table, database) : undefined;
+    const rows = await this.runSql<string[]>(
+      buildTagValuesQuery(options.key, database, options.filters, {
+        timeColumn,
+        windowSeconds: this.windowSeconds(options.timeRange),
+      }),
+      { refId: 'tagValues' }
+    );
     return rows.map((row) => ({ text: String(row[0]) }));
+  }
+
+  // Width of the recent-data window for bounding JSON scans: the request's time
+  // range when present, otherwise a default. Anchored at the data's own latest
+  // timestamp in SQL, so only the width (not the absolute instants) is used here.
+  private windowSeconds(timeRange?: TimeRange): number {
+    const span = timeRange ? Math.round((timeRange.to.valueOf() - timeRange.from.valueOf()) / 1000) : NaN;
+    if (!Number.isFinite(span) || span <= 0) {
+      return MySqlDatasource.DEFAULT_WINDOW_SECONDS;
+    }
+    return Math.max(300, span);
+  }
+
+  // Resolves (and caches) a table's datetime column used to bound JSON scans.
+  private async resolveTimeColumn(table: string, database?: string): Promise<string | undefined> {
+    const cacheKey = `${database ?? ''}.${table}`;
+    const cached = this.timeColumnCache.get(cacheKey);
+    if (cached !== undefined) {
+      return cached || undefined;
+    }
+    let timeColumn = '';
+    try {
+      const frame = await this.runSql<string[]>(buildTimeColumnQuery(table, database), { refId: 'tagTimeColumn' });
+      const cols = frame.map((row) => ({ name: row[0], dataType: row[1] ?? '' }));
+      timeColumn = pickTimeColumn(cols) ?? '';
+    } catch {
+      timeColumn = '';
+    }
+    this.timeColumnCache.set(cacheKey, timeColumn);
+    return timeColumn || undefined;
   }
 
   getSqlLanguageDefinition(): LanguageDefinition {

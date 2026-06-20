@@ -9,9 +9,12 @@ import {
   buildTagColumnsQuery,
   buildTagKeysQuery,
   buildTagValuesQuery,
+  buildTimeColumnQuery,
   collectJsonKeys,
   filterToSql,
   parseAdHocKey,
+  pickTimeColumn,
+  recentWindowClause,
   shouldProbeForJsonKeys,
   whereFromFilters,
 } from './adHocFilters';
@@ -49,7 +52,7 @@ describe('JSON drill-down keys', () => {
   it('lists distinct values of a JSON path with a bounded inner scan', () => {
     expect(buildTagValuesQuery('otel_logs.body["channel_id"]', 'otel')).toBe(
       `SELECT DISTINCT JSON_UNQUOTE(JSON_EXTRACT(body, '$."channel_id"')) FROM ` +
-        `(SELECT body FROM otel.otel_logs WHERE body IS NOT NULL LIMIT 200000) t ` +
+        `(SELECT body FROM otel.otel_logs WHERE body IS NOT NULL LIMIT 20000) t ` +
         `WHERE JSON_UNQUOTE(JSON_EXTRACT(body, '$."channel_id"')) IS NOT NULL ORDER BY 1 LIMIT 1000`
     );
   });
@@ -263,7 +266,7 @@ describe('cascading pickers (whereFromFilters)', () => {
     const fs = [filter({ key: 'otel_logs.service_name', operator: '=', value: 'one-api' })];
     expect(buildTagValuesQuery('otel_logs.body["status_code"]', 'otel', fs)).toBe(
       `SELECT DISTINCT JSON_UNQUOTE(JSON_EXTRACT(body, '$."status_code"')) FROM ` +
-        `(SELECT body FROM otel.otel_logs WHERE body IS NOT NULL AND service_name = 'one-api' LIMIT 200000) t ` +
+        `(SELECT body FROM otel.otel_logs WHERE body IS NOT NULL AND service_name = 'one-api' LIMIT 20000) t ` +
         `WHERE JSON_UNQUOTE(JSON_EXTRACT(body, '$."status_code"')) IS NOT NULL ORDER BY 1 LIMIT 1000`
     );
   });
@@ -274,5 +277,75 @@ describe('cascading pickers (whereFromFilters)', () => {
       "SELECT array_join(JSON_KEYS(CAST(body AS STRING)), ',') FROM otel.otel_logs " +
         "WHERE body IS NOT NULL AND service_name = 'one-api' LIMIT 500"
     );
+  });
+});
+
+describe('recent-window time bound', () => {
+  it('anchors the window at the data MAX, not the server clock', () => {
+    expect(recentWindowClause('timestamp', 'otel.otel_logs', 3600)).toBe(
+      'timestamp >= (SELECT MAX(timestamp) FROM otel.otel_logs) - INTERVAL 3600 SECOND'
+    );
+  });
+
+  it('returns empty when the time column or window is missing', () => {
+    expect(recentWindowClause(undefined, 'otel.otel_logs', 3600)).toBe('');
+    expect(recentWindowClause('timestamp', 'otel.otel_logs', 0)).toBe('');
+  });
+
+  it('bounds JSON value lookups to recent partitions', () => {
+    expect(
+      buildTagValuesQuery('otel_logs.body["status_code"]', 'otel', undefined, {
+        timeColumn: 'timestamp',
+        windowSeconds: 1800,
+      })
+    ).toBe(
+      `SELECT DISTINCT JSON_UNQUOTE(JSON_EXTRACT(body, '$."status_code"')) FROM ` +
+        `(SELECT body FROM otel.otel_logs WHERE body IS NOT NULL AND ` +
+        `timestamp >= (SELECT MAX(timestamp) FROM otel.otel_logs) - INTERVAL 1800 SECOND LIMIT 20000) t ` +
+        `WHERE JSON_UNQUOTE(JSON_EXTRACT(body, '$."status_code"')) IS NOT NULL ORDER BY 1 LIMIT 1000`
+    );
+  });
+
+  it('does not bound plain-column value lookups', () => {
+    expect(
+      buildTagValuesQuery('otel_logs.status', 'otel', undefined, { timeColumn: 'timestamp', windowSeconds: 1800 })
+    ).toBe('SELECT DISTINCT status FROM otel.otel_logs WHERE status IS NOT NULL ORDER BY 1 LIMIT 1000');
+  });
+
+  it('bounds JSON key sampling to recent partitions', () => {
+    expect(buildJsonKeysSampleQuery('otel_logs', 'body', 'otel', undefined, { timeColumn: 'timestamp', windowSeconds: 1800 })).toBe(
+      "SELECT array_join(JSON_KEYS(CAST(body AS STRING)), ',') FROM otel.otel_logs WHERE body IS NOT NULL AND " +
+        'timestamp >= (SELECT MAX(timestamp) FROM otel.otel_logs) - INTERVAL 1800 SECOND LIMIT 500'
+    );
+  });
+});
+
+describe('pickTimeColumn / buildTimeColumnQuery', () => {
+  it('prefers a conventional time column name', () => {
+    expect(
+      pickTimeColumn([
+        { name: 'created_at', dataType: 'datetime' },
+        { name: 'timestamp', dataType: 'datetime' },
+      ])
+    ).toBe('timestamp');
+  });
+
+  it('falls back to the first datetime/date column', () => {
+    expect(
+      pickTimeColumn([
+        { name: 'name', dataType: 'varchar' },
+        { name: 'logged', dataType: 'datetime' },
+      ])
+    ).toBe('logged');
+  });
+
+  it('returns null when no temporal column exists', () => {
+    expect(pickTimeColumn([{ name: 'name', dataType: 'varchar' }])).toBeNull();
+  });
+
+  it('scopes the time-column query to a single table', () => {
+    const q = buildTimeColumnQuery('otel_logs', 'otel');
+    expect(q).toContain("table_schema = 'otel'");
+    expect(q).toContain("table_name = 'otel_logs'");
   });
 });

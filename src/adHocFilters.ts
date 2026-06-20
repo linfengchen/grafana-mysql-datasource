@@ -211,6 +211,47 @@ export function buildTagColumnsQuery(database?: string): string {
   );
 }
 
+// Column types usable as a time bound, and preferred names when several exist.
+const TIME_COLUMN_TYPES = new Set(['datetime', 'timestamp', 'date']);
+const TIME_COLUMN_NAME_PRIORITY = [
+  'timestamp',
+  '@timestamp',
+  'time',
+  'ts',
+  'event_time',
+  'log_time',
+  'created_at',
+  'create_time',
+];
+
+/** Lists a single table's columns and types so a time column can be detected. */
+export function buildTimeColumnQuery(table: string, database?: string): string {
+  const schema = database ? quoteLiteral(unquoteIdentifier(database)) : 'database()';
+  return (
+    `SELECT column_name, data_type FROM information_schema.columns ` +
+    `WHERE table_schema = ${schema} AND table_name = ${quoteLiteral(unquoteIdentifier(table))} ` +
+    `ORDER BY ordinal_position`
+  );
+}
+
+/**
+ * Picks the column to use as a time bound: a datetime/timestamp/date column,
+ * preferring conventional names. Returns null when the table has none.
+ */
+export function pickTimeColumn(columns: Array<{ name: string; dataType: string }>): string | null {
+  const candidates = columns.filter((c) => TIME_COLUMN_TYPES.has((c.dataType ?? '').trim().toLowerCase()));
+  if (candidates.length === 0) {
+    return null;
+  }
+  for (const preferred of TIME_COLUMN_NAME_PRIORITY) {
+    const hit = candidates.find((c) => c.name.toLowerCase() === preferred);
+    if (hit) {
+      return hit.name;
+    }
+  }
+  return candidates[0].name;
+}
+
 // Column types that may hold a JSON object and are therefore worth probing for
 // drillable keys. `variant`/`json` are JSON for sure; text types are sampled
 // because a plain string column can still store serialized JSON (e.g. `body`).
@@ -255,18 +296,27 @@ export function buildJsonKeysSampleQuery(
   column: string,
   database?: string,
   filters?: AdHocVariableFilter[],
-  sampleSize = 500
+  opts?: { timeColumn?: string; windowSeconds?: number; sampleSize?: number }
 ): string {
   const col = quoteIdentifierIfNecessary(column);
   const tableName = quoteIdentifierIfNecessary(table);
   const from = database ? `${quoteIdentifierIfNecessary(database)}.${tableName}` : tableName;
+  const sampleSize = opts?.sampleSize ?? 500;
+  const conds = [`${col} IS NOT NULL`];
   // Cascade: sample only rows matching the other active filters so the discovered
   // keys are relevant to the current selection instead of the whole table.
   const cascade = whereFromFilters(filters, { table });
-  const where = cascade ? `${col} IS NOT NULL AND ${cascade}` : `${col} IS NOT NULL`;
+  if (cascade) {
+    conds.push(cascade);
+  }
+  // Bound the sample to recent partitions so key discovery stays fast on large tables.
+  const window = recentWindowClause(opts?.timeColumn, from, opts?.windowSeconds);
+  if (window) {
+    conds.push(window);
+  }
   return (
     `SELECT array_join(JSON_KEYS(CAST(${col} AS STRING)), ${quoteLiteral(JSON_KEYS_SEPARATOR)}) ` +
-    `FROM ${from} WHERE ${where} LIMIT ${sampleSize}`
+    `FROM ${from} WHERE ${conds.join(' AND ')} LIMIT ${sampleSize}`
   );
 }
 
@@ -307,23 +357,50 @@ export function buildJsonAdHocKey(table: string, column: string, jsonKey: string
 // time out the value picker. Bounding the scan keeps it responsive; suggestions
 // may be incomplete, but "Allow custom values" lets users type exact values and
 // the filter itself still applies to all rows.
-const JSON_VALUE_SCAN_LIMIT = 200000;
+const JSON_VALUE_SCAN_LIMIT = 20000;
+
+/**
+ * Builds a predicate that bounds a scan to the most recent `windowSeconds` of data
+ * for partition pruning. The window is anchored at the data's own latest timestamp
+ * (`MAX(timeColumn)`), not the server clock, so it works regardless of how the
+ * timestamps are stored relative to the DB's timezone — comparing the column to a
+ * value derived from the same column never has a timezone skew. Returns '' when no
+ * time column or window is available.
+ */
+export function recentWindowClause(timeColumn?: string, from?: string, windowSeconds?: number): string {
+  if (!timeColumn || !from || !windowSeconds || windowSeconds <= 0) {
+    return '';
+  }
+  const col = quoteIdentifierIfNecessary(timeColumn);
+  return `${col} >= (SELECT MAX(${col}) FROM ${from}) - INTERVAL ${Math.floor(windowSeconds)} SECOND`;
+}
+
+export interface TagValueOptions {
+  limit?: number;
+  /** Datetime/timestamp column used to bound JSON scans to recent partitions. */
+  timeColumn?: string;
+  /** Width of the recent-data window in seconds (typically the dashboard range). */
+  windowSeconds?: number;
+}
 
 /**
  * Query that lists the distinct values of an ad hoc filter key (`table.column`).
  * Plain columns are scanned in full (Doris evaluates columnar DISTINCT cheaply);
- * JSON drill-downs are bounded to {@link JSON_VALUE_SCAN_LIMIT} rows to stay fast.
+ * JSON drill-downs are bounded to {@link JSON_VALUE_SCAN_LIMIT} rows *and*, when a
+ * time column is known, to the recent-data window so a selective cascade cannot
+ * trigger a full scan of a partitioned multi-hundred-million-row table.
  */
 export function buildTagValuesQuery(
   key: string,
   database?: string,
   filters?: AdHocVariableFilter[],
-  limit = 1000
+  opts?: TagValueOptions
 ): string {
   const { table, column, jsonPath } = parseAdHocKey(key);
   const tableName = quoteIdentifierIfNecessary(table ?? column);
   const from = database ? `${quoteIdentifierIfNecessary(database)}.${tableName}` : tableName;
   const expr = columnExpr(column, jsonPath);
+  const limit = opts?.limit ?? 1000;
   // Cascade: only offer values present in rows matching the other active filters.
   const cascade = whereFromFilters(filters, { excludeKey: key, table });
 
@@ -333,12 +410,20 @@ export function buildTagValuesQuery(
   }
 
   const col = quoteIdentifierIfNecessary(column);
-  // Apply the cascade inside the bounded scan so the sampled rows are the relevant
-  // ones, not an arbitrary slice that may exclude every matching row.
-  const innerWhere = cascade ? `${col} IS NOT NULL AND ${cascade}` : `${col} IS NOT NULL`;
+  // Apply the cascade and the recent-data window inside the bounded scan so the
+  // sampled rows are the relevant ones, not an arbitrary slice that may exclude
+  // every matching row.
+  const innerConds = [`${col} IS NOT NULL`];
+  if (cascade) {
+    innerConds.push(cascade);
+  }
+  const window = recentWindowClause(opts?.timeColumn, from, opts?.windowSeconds);
+  if (window) {
+    innerConds.push(window);
+  }
   return (
     `SELECT DISTINCT ${expr} FROM ` +
-    `(SELECT ${col} FROM ${from} WHERE ${innerWhere} LIMIT ${JSON_VALUE_SCAN_LIMIT}) t ` +
+    `(SELECT ${col} FROM ${from} WHERE ${innerConds.join(' AND ')} LIMIT ${JSON_VALUE_SCAN_LIMIT}) t ` +
     `WHERE ${expr} IS NOT NULL ORDER BY 1 LIMIT ${limit}`
   );
 }
