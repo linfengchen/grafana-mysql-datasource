@@ -91,6 +91,18 @@ describe('filterToSql', () => {
     );
   });
 
+  it('maps the "is one of" operator (=|) to IN', () => {
+    expect(filterToSql(filter({ operator: '=|', value: 'web01', values: ['web01', 'web02'] }))).toBe(
+      "host IN ('web01', 'web02')"
+    );
+  });
+
+  it('maps the "is not one of" operator (!=|) to NOT IN', () => {
+    expect(filterToSql(filter({ operator: '!=|', value: 'web01', values: ['web01', 'web02'] }))).toBe(
+      "host NOT IN ('web01', 'web02')"
+    );
+  });
+
   it('uses only the column part of a table.column key', () => {
     expect(filterToSql(filter({ key: 'metrics.host', value: 'web01' }))).toBe("host = 'web01'");
   });

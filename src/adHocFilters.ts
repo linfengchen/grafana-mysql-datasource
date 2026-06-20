@@ -101,6 +101,11 @@ export function filterToSql(filter: AdHocVariableFilter): string | undefined {
         return `${column} NOT IN (${values.map(quoteLiteral).join(', ')})`;
       }
       return `${column} != ${quoteLiteral(values[0])}`;
+    // Grafana's dedicated multi-value operators ("is one of" / "is not one of").
+    case '=|':
+      return `${column} IN (${values.map(quoteLiteral).join(', ')})`;
+    case '!=|':
+      return `${column} NOT IN (${values.map(quoteLiteral).join(', ')})`;
     case '<':
     case '<=':
     case '>':
