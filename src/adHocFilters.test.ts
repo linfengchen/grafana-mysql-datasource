@@ -13,6 +13,7 @@ import {
   filterToSql,
   parseAdHocKey,
   shouldProbeForJsonKeys,
+  whereFromFilters,
 } from './adHocFilters';
 
 const filter = (overrides: Partial<AdHocVariableFilter>): AdHocVariableFilter => ({
@@ -219,6 +220,59 @@ describe('buildTagValuesQuery', () => {
   it('quotes reserved-word identifiers', () => {
     expect(buildTagValuesQuery('order.select')).toBe(
       'SELECT DISTINCT `select` FROM `order` WHERE `select` IS NOT NULL ORDER BY 1 LIMIT 1000'
+    );
+  });
+});
+
+describe('cascading pickers (whereFromFilters)', () => {
+  it('joins same-table filters with AND', () => {
+    const fs = [
+      filter({ key: 'otel_logs.service_name', operator: '=', value: 'one-api' }),
+      filter({ key: 'otel_logs.body["func"]', operator: '=', value: 'access' }),
+    ];
+    expect(whereFromFilters(fs, { table: 'otel_logs' })).toBe(
+      `service_name = 'one-api' AND JSON_UNQUOTE(JSON_EXTRACT(body, '$."func"')) = 'access'`
+    );
+  });
+
+  it('excludes the key being edited and cross-table filters', () => {
+    const fs = [
+      filter({ key: 'otel_logs.service_name', operator: '=', value: 'one-api' }),
+      filter({ key: 'otel_logs.status', operator: '=', value: '200' }),
+      filter({ key: 'other_table.x', operator: '=', value: 'y' }),
+    ];
+    expect(whereFromFilters(fs, { excludeKey: 'otel_logs.status', table: 'otel_logs' })).toBe(
+      "service_name = 'one-api'"
+    );
+  });
+
+  it('returns empty string when nothing applies', () => {
+    expect(whereFromFilters(undefined)).toBe('');
+    expect(whereFromFilters([], { table: 'otel_logs' })).toBe('');
+  });
+
+  it('scopes plain value lookups to the other filters', () => {
+    const fs = [filter({ key: 'otel_logs.service_name', operator: '=', value: 'one-api' })];
+    expect(buildTagValuesQuery('otel_logs.status', 'otel', fs)).toBe(
+      "SELECT DISTINCT status FROM otel.otel_logs WHERE status IS NOT NULL AND service_name = 'one-api' " +
+        'ORDER BY 1 LIMIT 1000'
+    );
+  });
+
+  it('scopes JSON value lookups inside the bounded scan', () => {
+    const fs = [filter({ key: 'otel_logs.service_name', operator: '=', value: 'one-api' })];
+    expect(buildTagValuesQuery('otel_logs.body["status_code"]', 'otel', fs)).toBe(
+      `SELECT DISTINCT JSON_UNQUOTE(JSON_EXTRACT(body, '$."status_code"')) FROM ` +
+        `(SELECT body FROM otel.otel_logs WHERE body IS NOT NULL AND service_name = 'one-api' LIMIT 200000) t ` +
+        `WHERE JSON_UNQUOTE(JSON_EXTRACT(body, '$."status_code"')) IS NOT NULL ORDER BY 1 LIMIT 1000`
+    );
+  });
+
+  it('scopes JSON key discovery to the other filters', () => {
+    const fs = [filter({ key: 'otel_logs.service_name', operator: '=', value: 'one-api' })];
+    expect(buildJsonKeysSampleQuery('otel_logs', 'body', 'otel', fs)).toBe(
+      "SELECT array_join(JSON_KEYS(CAST(body AS STRING)), ',') FROM otel.otel_logs " +
+        "WHERE body IS NOT NULL AND service_name = 'one-api' LIMIT 500"
     );
   });
 });

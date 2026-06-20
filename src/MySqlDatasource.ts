@@ -68,8 +68,9 @@ export class MySqlDatasource extends SqlDatasource {
   // text columns storing serialized JSON like `body`) are auto-probed: their
   // top-level keys are sampled and exposed as drillable `table.column["key"]`
   // entries, replacing the bare column (which cannot be DISTINCT-ed directly).
-  async getTagKeys(_options?: DataSourceGetTagKeysOptions<SQLQuery>): Promise<MetricFindValue[]> {
+  async getTagKeys(options?: DataSourceGetTagKeysOptions<SQLQuery>): Promise<MetricFindValue[]> {
     const database = this.instanceSettings.jsonData.database;
+    const filters = options?.filters;
     const frame = await this.runSql<string[]>(buildTagColumnsQuery(database), { refId: 'tagKeys' });
     // DataFrameView rows are positional: [table_name, column_name, data_type].
     const columns = frame.map((row) => ({ table: row[0], column: row[1], dataType: row[2] }));
@@ -88,7 +89,7 @@ export class MySqlDatasource extends SqlDatasource {
     const sampled = await Promise.all(
       probes.slice(0, MySqlDatasource.MAX_JSON_PROBE_COLUMNS).map(async ({ table, column }) => {
         try {
-          const sample = await this.runSql<string[]>(buildJsonKeysSampleQuery(table, column, database), {
+          const sample = await this.runSql<string[]>(buildJsonKeysSampleQuery(table, column, database, filters), {
             refId: `jsonKeys:${table}.${column}`,
           });
           // Normalize the DataFrameView into positional rows before unioning keys.
@@ -118,7 +119,9 @@ export class MySqlDatasource extends SqlDatasource {
   // Provides the distinct values for a selected ad hoc filter key.
   async getTagValues(options: DataSourceGetTagValuesOptions<SQLQuery>): Promise<MetricFindValue[]> {
     const database = this.instanceSettings.jsonData.database;
-    const rows = await this.runSql<string[]>(buildTagValuesQuery(options.key, database), { refId: 'tagValues' });
+    const rows = await this.runSql<string[]>(buildTagValuesQuery(options.key, database, options.filters), {
+      refId: 'tagValues',
+    });
     return rows.map((row) => ({ text: String(row[0]) }));
   }
 

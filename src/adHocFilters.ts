@@ -137,6 +137,43 @@ export function buildAdHocFilterClause(filters?: AdHocVariableFilter[]): string 
 }
 
 /**
+ * Builds a boolean expression from the *other* active ad hoc filters, used to make
+ * the key/value pickers cascade: only keys/values that exist in rows matching the
+ * already-selected filters are offered. Returns '' when there is nothing to add.
+ *
+ * - `excludeKey` drops the filter on the key currently being edited (so its own
+ *   selection doesn't constrain its value list).
+ * - `table` keeps only filters targeting the same table, since the generated
+ *   expressions use unqualified columns and would otherwise reference columns that
+ *   don't exist in the queried table.
+ */
+export function whereFromFilters(
+  filters?: AdHocVariableFilter[],
+  opts?: { excludeKey?: string; table?: string }
+): string {
+  if (!filters || filters.length === 0) {
+    return '';
+  }
+  const expressions = filters
+    .filter((f) => {
+      if (!f.key || f.key === opts?.excludeKey) {
+        return false;
+      }
+      if (opts?.table) {
+        const filterTable = parseAdHocKey(f.key).table;
+        if (filterTable && filterTable !== opts.table) {
+          return false;
+        }
+      }
+      return true;
+    })
+    .map(filterToSql)
+    .filter((expr): expr is string => expr !== undefined);
+
+  return expressions.join(' AND ');
+}
+
+/**
  * Replaces every `$__adHocFilter()` macro in the SQL with the conditions derived
  * from the active ad hoc filters.
  */
@@ -213,13 +250,23 @@ const JSON_KEYS_SEPARATOR = ',';
  * Grafana MySQL backend cannot serialize — without it the whole field is dropped
  * and no keys are discovered.
  */
-export function buildJsonKeysSampleQuery(table: string, column: string, database?: string, sampleSize = 500): string {
+export function buildJsonKeysSampleQuery(
+  table: string,
+  column: string,
+  database?: string,
+  filters?: AdHocVariableFilter[],
+  sampleSize = 500
+): string {
   const col = quoteIdentifierIfNecessary(column);
   const tableName = quoteIdentifierIfNecessary(table);
   const from = database ? `${quoteIdentifierIfNecessary(database)}.${tableName}` : tableName;
+  // Cascade: sample only rows matching the other active filters so the discovered
+  // keys are relevant to the current selection instead of the whole table.
+  const cascade = whereFromFilters(filters, { table });
+  const where = cascade ? `${col} IS NOT NULL AND ${cascade}` : `${col} IS NOT NULL`;
   return (
     `SELECT array_join(JSON_KEYS(CAST(${col} AS STRING)), ${quoteLiteral(JSON_KEYS_SEPARATOR)}) ` +
-    `FROM ${from} WHERE ${col} IS NOT NULL LIMIT ${sampleSize}`
+    `FROM ${from} WHERE ${where} LIMIT ${sampleSize}`
   );
 }
 
@@ -267,20 +314,31 @@ const JSON_VALUE_SCAN_LIMIT = 200000;
  * Plain columns are scanned in full (Doris evaluates columnar DISTINCT cheaply);
  * JSON drill-downs are bounded to {@link JSON_VALUE_SCAN_LIMIT} rows to stay fast.
  */
-export function buildTagValuesQuery(key: string, database?: string, limit = 1000): string {
+export function buildTagValuesQuery(
+  key: string,
+  database?: string,
+  filters?: AdHocVariableFilter[],
+  limit = 1000
+): string {
   const { table, column, jsonPath } = parseAdHocKey(key);
   const tableName = quoteIdentifierIfNecessary(table ?? column);
   const from = database ? `${quoteIdentifierIfNecessary(database)}.${tableName}` : tableName;
   const expr = columnExpr(column, jsonPath);
+  // Cascade: only offer values present in rows matching the other active filters.
+  const cascade = whereFromFilters(filters, { excludeKey: key, table });
 
   if (jsonPath.length === 0) {
-    return `SELECT DISTINCT ${expr} FROM ${from} WHERE ${expr} IS NOT NULL ORDER BY 1 LIMIT ${limit}`;
+    const where = cascade ? `${expr} IS NOT NULL AND ${cascade}` : `${expr} IS NOT NULL`;
+    return `SELECT DISTINCT ${expr} FROM ${from} WHERE ${where} ORDER BY 1 LIMIT ${limit}`;
   }
 
   const col = quoteIdentifierIfNecessary(column);
+  // Apply the cascade inside the bounded scan so the sampled rows are the relevant
+  // ones, not an arbitrary slice that may exclude every matching row.
+  const innerWhere = cascade ? `${col} IS NOT NULL AND ${cascade}` : `${col} IS NOT NULL`;
   return (
     `SELECT DISTINCT ${expr} FROM ` +
-    `(SELECT ${col} FROM ${from} WHERE ${col} IS NOT NULL LIMIT ${JSON_VALUE_SCAN_LIMIT}) t ` +
+    `(SELECT ${col} FROM ${from} WHERE ${innerWhere} LIMIT ${JSON_VALUE_SCAN_LIMIT}) t ` +
     `WHERE ${expr} IS NOT NULL ORDER BY 1 LIMIT ${limit}`
   );
 }
