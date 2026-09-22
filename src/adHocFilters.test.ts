@@ -6,6 +6,7 @@ import {
   buildAdHocFilterClause,
   buildJsonAdHocKey,
   buildJsonKeysSampleQuery,
+  buildMaxTimeQuery,
   buildTagColumnsQuery,
   buildTagKeysQuery,
   buildTagValuesQuery,
@@ -113,6 +114,10 @@ describe('filterToSql', () => {
 
   it('escapes single quotes in values to prevent injection', () => {
     expect(filterToSql(filter({ value: "x' OR '1'='1" }))).toBe("host = 'x'' OR ''1''=''1'");
+  });
+
+  it('doubles backslashes in values so they cannot escape the closing quote', () => {
+    expect(filterToSql(filter({ value: 'C:\\' }))).toBe("host = 'C:\\\\'");
   });
 
   it('returns undefined for unknown operators', () => {
@@ -293,41 +298,76 @@ describe('cascading pickers (whereFromFilters)', () => {
 });
 
 describe('recent-window time bound', () => {
-  it('anchors the window at the data MAX, not the server clock', () => {
-    expect(recentWindowClause('timestamp', 'otel.otel_logs', 3600)).toBe(
-      'timestamp >= (SELECT MAX(timestamp) FROM otel.otel_logs) - INTERVAL 3600 SECOND'
+  const MAX_TIME = '2026-09-22 21:34:25';
+
+  it('anchors the window at a resolved data MAX rather than a subquery', () => {
+    expect(recentWindowClause('timestamp', MAX_TIME, 3600)).toBe(
+      `timestamp >= TIMESTAMP('${MAX_TIME}') - INTERVAL 3600 SECOND`
     );
   });
 
-  it('returns empty when the time column or window is missing', () => {
-    expect(recentWindowClause(undefined, 'otel.otel_logs', 3600)).toBe('');
-    expect(recentWindowClause('timestamp', 'otel.otel_logs', 0)).toBe('');
+  it('returns empty when the time column, anchor or window is missing', () => {
+    expect(recentWindowClause(undefined, MAX_TIME, 3600)).toBe('');
+    expect(recentWindowClause('timestamp', undefined, 3600)).toBe('');
+    expect(recentWindowClause('timestamp', MAX_TIME, 0)).toBe('');
+  });
+
+  it('resolves the anchor as a formatted string so it carries no timezone', () => {
+    expect(buildMaxTimeQuery('otel_logs', 'timestamp', 'otel')).toBe(
+      "SELECT DATE_FORMAT(MAX(timestamp), '%Y-%m-%d %H:%i:%s') FROM otel.otel_logs"
+    );
+  });
+
+  it('quotes reserved-word identifiers in the anchor query', () => {
+    expect(buildMaxTimeQuery('order', 'timestamp', 'otel')).toBe(
+      "SELECT DATE_FORMAT(MAX(timestamp), '%Y-%m-%d %H:%i:%s') FROM otel.`order`"
+    );
   });
 
   it('bounds JSON value lookups to recent partitions', () => {
     expect(
       buildTagValuesQuery('otel_logs.body["status_code"]', 'otel', undefined, {
         timeColumn: 'timestamp',
+        maxTime: MAX_TIME,
         windowSeconds: 1800,
       })
     ).toBe(
       `SELECT DISTINCT JSON_UNQUOTE(JSON_EXTRACT(body, '$."status_code"')) FROM ` +
         `(SELECT body FROM otel.otel_logs WHERE body IS NOT NULL AND ` +
-        `timestamp >= (SELECT MAX(timestamp) FROM otel.otel_logs) - INTERVAL 1800 SECOND LIMIT 20000) t ` +
+        `timestamp >= TIMESTAMP('${MAX_TIME}') - INTERVAL 1800 SECOND LIMIT 20000) t ` +
         `WHERE JSON_UNQUOTE(JSON_EXTRACT(body, '$."status_code"')) IS NOT NULL ORDER BY 1 LIMIT 1000`
     );
   });
 
-  it('does not bound plain-column value lookups', () => {
+  it('bounds plain-column value lookups too, since DISTINCT still groups every row', () => {
+    expect(
+      buildTagValuesQuery('otel_logs.status', 'otel', undefined, {
+        timeColumn: 'timestamp',
+        maxTime: MAX_TIME,
+        windowSeconds: 1800,
+      })
+    ).toBe(
+      `SELECT DISTINCT status FROM otel.otel_logs WHERE status IS NOT NULL AND ` +
+        `timestamp >= TIMESTAMP('${MAX_TIME}') - INTERVAL 1800 SECOND ORDER BY 1 LIMIT 1000`
+    );
+  });
+
+  it('leaves value lookups unbounded when no anchor could be resolved', () => {
     expect(
       buildTagValuesQuery('otel_logs.status', 'otel', undefined, { timeColumn: 'timestamp', windowSeconds: 1800 })
     ).toBe('SELECT DISTINCT status FROM otel.otel_logs WHERE status IS NOT NULL ORDER BY 1 LIMIT 1000');
   });
 
   it('bounds JSON key sampling to recent partitions', () => {
-    expect(buildJsonKeysSampleQuery('otel_logs', 'body', 'otel', undefined, { timeColumn: 'timestamp', windowSeconds: 1800 })).toBe(
+    expect(
+      buildJsonKeysSampleQuery('otel_logs', 'body', 'otel', undefined, {
+        timeColumn: 'timestamp',
+        maxTime: MAX_TIME,
+        windowSeconds: 1800,
+      })
+    ).toBe(
       "SELECT array_join(JSON_KEYS(CAST(body AS STRING)), ',') FROM otel.otel_logs WHERE body IS NOT NULL AND " +
-        'timestamp >= (SELECT MAX(timestamp) FROM otel.otel_logs) - INTERVAL 1800 SECOND LIMIT 500'
+        `timestamp >= TIMESTAMP('${MAX_TIME}') - INTERVAL 1800 SECOND LIMIT 500`
     );
   });
 });
