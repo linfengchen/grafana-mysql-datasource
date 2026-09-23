@@ -103,7 +103,10 @@ JSON_UNQUOTE(JSON_EXTRACT(log_attributes, '$."response_code"')) = '200'
    > Grafana 的 MySQL 后端无法序列化该类型会丢行，拼成普通字符串后才稳定；
 3. 把发现了键的 JSON 列替换成 `列["键"]` 形式列出（裸的 JSON 列会被隐藏，
    因为它无法直接 `DISTINCT` 取唯一值）；数字/时间列跳过探测；
-4. 探测并发执行，最多探测 40 列，避免超宽 schema 把下拉打开变慢。
+4. 探测最多覆盖 40 列，且同时在途不超过 4 条，避免超宽 schema 把下拉打开变慢、
+   也避免一次把几十条探测同时压给数据库。
+5. 结果按「库 + 时间范围 + 当前已选条件」缓存 60 秒，并发调用共用同一次探测，
+   反复打开下拉不会重复触发整批探测。
 
 取值与 WHERE 条件统一走 `JSON_UNQUOTE(JSON_EXTRACT(列, '$."键"'))`。
 
@@ -170,11 +173,16 @@ JSON_UNQUOTE(JSON_EXTRACT(log_attributes, '$."response_code"')) = '200'
 1. **强刷页面**：插件更新后首次使用，按 `Ctrl/Cmd + Shift + R` 清掉浏览器缓存的旧前端
    （走反代域名时可能要刷两次或用无痕窗口）。
 2. **键来自采样**：稀疏 / 仅历史数据里出现的 JSON 键可能不在自动列表 → 手输 + “Allow custom values” 补。
-3. **值下拉性能**：JSON 字段取值会被限制在「最近一段数据」内（窗口宽度 = 当前仪表盘时间范围，
-   锚定在数据自身的 `MAX(时间列)` 上，**与时区无关**，靠按天分区裁剪），并叠加 2 万行扫描上限，
-   保证秒级响应。代价是稀疏键/更早数据里的建议值可能不全 → 手输 + “Allow custom values” 补。
+3. **值下拉性能**：取值会被限制在「最近一段数据」内（窗口宽度 = 当前仪表盘时间范围），
+   JSON 字段再叠加 2 万行扫描上限，保证秒级响应。代价是稀疏键/更早数据里的建议值可能不全
+   → 手输 + “Allow custom values” 补。
    时间列自动从 `information_schema` 探测（datetime/timestamp/date，优先 `timestamp` 等常见名）。
-   普通列为完整 DISTINCT（Doris 列式去重很快），不加窗口。
+   窗口锚定在数据自身的最新时间戳上（**与时区无关**）：该时间戳由一条单独的
+   `SELECT DATE_FORMAT(MAX(时间列), ...)` 先查出来（走 min/max 元数据，不读数据），
+   再以**字面量**拼进条件。不能写成 `(SELECT MAX(...))` 子查询——那样边界在编译期未知，
+   分区裁剪和 `LIMIT` 下推都会失效，采样 500 行会变成扫满整个窗口。
+   普通列同样加窗口：列式 `DISTINCT` 单行很便宜，但仍要对全表每一行分组，
+   在高基数文本列（日志正文、trace id）上就是一次全扫 + 上亿分组。
 4. **探测上限**：自动发现最多探测 40 列，超宽 schema 不会全扫。
 5. 这是未签名的自定义插件，需在 Grafana 用 `GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=evomap-mysql-datasource` 放行。
 

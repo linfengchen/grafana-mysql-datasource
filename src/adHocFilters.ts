@@ -301,7 +301,7 @@ export function buildJsonKeysSampleQuery(
   column: string,
   database?: string,
   filters?: AdHocVariableFilter[],
-  opts?: { timeColumn?: string; windowSeconds?: number; sampleSize?: number }
+  opts?: { timeColumn?: string; maxTime?: string; windowSeconds?: number; sampleSize?: number }
 ): string {
   const col = quoteIdentifierIfNecessary(column);
   const tableName = quoteIdentifierIfNecessary(table);
@@ -315,7 +315,7 @@ export function buildJsonKeysSampleQuery(
     conds.push(cascade);
   }
   // Bound the sample to recent partitions so key discovery stays fast on large tables.
-  const window = recentWindowClause(opts?.timeColumn, from, opts?.windowSeconds);
+  const window = recentWindowClause(opts?.timeColumn, opts?.maxTime, opts?.windowSeconds);
   if (window) {
     conds.push(window);
   }
@@ -365,35 +365,56 @@ export function buildJsonAdHocKey(table: string, column: string, jsonKey: string
 const JSON_VALUE_SCAN_LIMIT = 20000;
 
 /**
- * Builds a predicate that bounds a scan to the most recent `windowSeconds` of data
- * for partition pruning. The window is anchored at the data's own latest timestamp
- * (`MAX(timeColumn)`), not the server clock, so it works regardless of how the
- * timestamps are stored relative to the DB's timezone — comparing the column to a
- * value derived from the same column never has a timezone skew. Returns '' when no
- * time column or window is available.
+ * Query that resolves a table's latest timestamp as a plain `YYYY-MM-DD HH:MM:SS`
+ * string. Formatting in SQL keeps the value out of the transport layer's datetime
+ * parsing, so it never picks up a timezone conversion on the way back. Engines
+ * answer this from per-segment min/max metadata without reading the data.
  */
-export function recentWindowClause(timeColumn?: string, from?: string, windowSeconds?: number): string {
-  if (!timeColumn || !from || !windowSeconds || windowSeconds <= 0) {
+export function buildMaxTimeQuery(table: string, timeColumn: string, database?: string): string {
+  const col = quoteIdentifierIfNecessary(timeColumn);
+  const tableName = quoteIdentifierIfNecessary(table);
+  const from = database ? `${quoteIdentifierIfNecessary(database)}.${tableName}` : tableName;
+  return `SELECT DATE_FORMAT(MAX(${col}), '%Y-%m-%d %H:%i:%s') FROM ${from}`;
+}
+
+/**
+ * Builds a predicate that bounds a scan to the most recent `windowSeconds` of data.
+ * The window is anchored at the data's own latest timestamp (resolved separately by
+ * {@link buildMaxTimeQuery}), not the server clock, so it works regardless of how
+ * the timestamps are stored relative to the DB's timezone.
+ *
+ * `maxTime` is inlined as a literal rather than referenced as a `(SELECT MAX(...))`
+ * subquery on purpose: a subquery bound is unknown at plan time, which costs both
+ * partition pruning and — more expensively — `LIMIT` pushdown into the scan, since
+ * the planner has to introduce a join the limit cannot cross. Returns '' when no
+ * time column, anchor or window is available.
+ */
+export function recentWindowClause(timeColumn?: string, maxTime?: string, windowSeconds?: number): string {
+  if (!timeColumn || !maxTime || !windowSeconds || windowSeconds <= 0) {
     return '';
   }
   const col = quoteIdentifierIfNecessary(timeColumn);
-  return `${col} >= (SELECT MAX(${col}) FROM ${from}) - INTERVAL ${Math.floor(windowSeconds)} SECOND`;
+  return `${col} >= TIMESTAMP(${quoteLiteral(maxTime)}) - INTERVAL ${Math.floor(windowSeconds)} SECOND`;
 }
 
 export interface TagValueOptions {
   limit?: number;
-  /** Datetime/timestamp column used to bound JSON scans to recent partitions. */
+  /** Datetime/timestamp column used to bound scans to recent partitions. */
   timeColumn?: string;
+  /** The table's latest timestamp, anchoring the recent-data window. */
+  maxTime?: string;
   /** Width of the recent-data window in seconds (typically the dashboard range). */
   windowSeconds?: number;
 }
 
 /**
  * Query that lists the distinct values of an ad hoc filter key (`table.column`).
- * Plain columns are scanned in full (Doris evaluates columnar DISTINCT cheaply);
- * JSON drill-downs are bounded to {@link JSON_VALUE_SCAN_LIMIT} rows *and*, when a
- * time column is known, to the recent-data window so a selective cascade cannot
- * trigger a full scan of a partitioned multi-hundred-million-row table.
+ * Both branches are bounded to the recent-data window when a time column is known:
+ * a plain-column DISTINCT is cheap per row but still aggregates every row in the
+ * table, which on a high-cardinality text column (a log body, a trace id) means a
+ * full scan and a group per row. JSON drill-downs are additionally capped at
+ * {@link JSON_VALUE_SCAN_LIMIT} rows because extracting a path costs far more per
+ * row than comparing one.
  */
 export function buildTagValuesQuery(
   key: string,
@@ -409,9 +430,17 @@ export function buildTagValuesQuery(
   // Cascade: only offer values present in rows matching the other active filters.
   const cascade = whereFromFilters(filters, { excludeKey: key, table });
 
+  const window = recentWindowClause(opts?.timeColumn, opts?.maxTime, opts?.windowSeconds);
+
   if (jsonPath.length === 0) {
-    const where = cascade ? `${expr} IS NOT NULL AND ${cascade}` : `${expr} IS NOT NULL`;
-    return `SELECT DISTINCT ${expr} FROM ${from} WHERE ${where} ORDER BY 1 LIMIT ${limit}`;
+    const conds = [`${expr} IS NOT NULL`];
+    if (cascade) {
+      conds.push(cascade);
+    }
+    if (window) {
+      conds.push(window);
+    }
+    return `SELECT DISTINCT ${expr} FROM ${from} WHERE ${conds.join(' AND ')} ORDER BY 1 LIMIT ${limit}`;
   }
 
   const col = quoteIdentifierIfNecessary(column);
@@ -422,7 +451,6 @@ export function buildTagValuesQuery(
   if (cascade) {
     innerConds.push(cascade);
   }
-  const window = recentWindowClause(opts?.timeColumn, from, opts?.windowSeconds);
   if (window) {
     innerConds.push(window);
   }

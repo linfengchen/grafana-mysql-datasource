@@ -67,7 +67,10 @@ export function unquoteIdentifier(value: string) {
 }
 
 export function quoteLiteral(value: string) {
-  return "'" + value.replace(/'/g, "''") + "'";
+  // MySQL treats backslash as an escape character unless NO_BACKSLASH_ESCAPES is
+  // set, so doubling quotes alone leaves a trailing backslash able to escape the
+  // closing quote. Backslashes must be doubled first, before the quotes.
+  return "'" + value.replace(/\\/g, '\\\\').replace(/'/g, "''") + "'";
 }
 
 /**
