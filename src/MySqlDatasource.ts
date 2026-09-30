@@ -288,7 +288,7 @@ export class MySqlDatasource extends SqlDatasource {
         const frame = await this.runSql<string[]>(buildMaxTimeQuery(table, timeColumn, database), {
           refId: 'tagMaxTime',
         });
-        const value = frame[0]?.[0];
+        const value = frame.map((row) => row[0])[0];
         return value ? String(value) : undefined;
       } catch {
         return undefined;
