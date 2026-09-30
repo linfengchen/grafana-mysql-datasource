@@ -286,7 +286,7 @@ export class MySqlDatasource extends SqlDatasource {
     return cached(this.maxTimeCache, cacheKey, MySqlDatasource.METADATA_TTL_MS, async () => {
       try {
         const frame = await this.runSql<string[]>(buildMaxTimeQuery(table, timeColumn, database), {
-          refId: 'tagMaxTime',
+          refId: `tagMaxTime:${database ?? ''}.${table}`,
         });
         const value = frame.map((row) => row[0])[0];
         return value ? String(value) : undefined;

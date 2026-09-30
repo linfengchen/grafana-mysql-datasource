@@ -102,3 +102,41 @@ describe('getTagKeys against the production otel schema', () => {
     expect(unbounded).toEqual([]);
   });
 });
+
+// Grafana's backend service cancels an in-flight request when a new one is sent with
+// the same requestId, and runSql uses the refId as the requestId. Model that here.
+function setupWithCancellation() {
+  const instanceSettings = { jsonData: { database: 'otel' } } as unknown as DataSourceInstanceSettings<MySQLOptions>;
+  const ds = new MySqlDatasource(instanceSettings);
+  const sqls: string[] = [];
+  const inFlight = new Map<string, (err: Error) => void>();
+  jest.spyOn(ds, 'runSql').mockImplementation((async (sql: string, options?: { refId?: string }) => {
+    sqls.push(sql);
+    const refId = options?.refId ?? 'meta';
+    inFlight.get(refId)?.(new Error('request cancelled'));
+    const cancelled = new Promise<never>((_, reject) => inFlight.set(refId, reject));
+    const answer = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      if (sql.includes('information_schema.columns')) {
+        return frameOf(OTEL_SCHEMA);
+      }
+      if (sql.includes('DATE_FORMAT(MAX(')) {
+        return frameOf([[ANCHOR]]);
+      }
+      return frameOf([['k1,k2']]);
+    };
+    return Promise.race([answer(), cancelled]);
+  }) as unknown as MySqlDatasource['runSql']);
+  return { ds, sqls };
+}
+
+describe('getTagKeys when concurrent requests with the same refId cancel each other', () => {
+  it('still anchors every probe of every table', async () => {
+    const { ds, sqls } = setupWithCancellation();
+    await ds.getTagKeys();
+    const probes = sqls.filter((s) => s.startsWith('SELECT array_join(JSON_KEYS('));
+    expect(probes.length).toBeGreaterThan(0);
+    const unbounded = probes.filter((s) => !s.includes(`TIMESTAMP('${ANCHOR}')`));
+    expect(unbounded).toEqual([]);
+  });
+});
